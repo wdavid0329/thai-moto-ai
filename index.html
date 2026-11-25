@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>泰國機車即時辨識</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.0/dist/ort.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body {
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+      width: 100vw;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* 主視覺區：全螢幕相機 */
+    #stage {
+      position: relative;
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    video, #uploadedImg, #overlay {
+      position: absolute;
+      max-width: 100%;
+      max-height: 100%;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    #uploadedImg { display: none; }
+    #overlay { pointer-events: none; z-index: 2; }
+
+    /* 頂部狀態列 */
+    #topBar {
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      z-index: 10;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 14px;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.75), transparent);
+      font-size: 13px;
+    }
+    .badge {
+      background: rgba(0,0,0,0.6);
+      border: 1px solid rgba(255,255,255,0.2);
+      padding: 5px 10px;
+      border-radius: 20px;
+      backdrop-filter: blur(4px);
+    }
+    #uploadLabel {
+      background: rgba(37, 99, 235, 0.85);
+      padding: 6px 12px;
+      border-radius: 20px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    #fileInput { display: none; }
+
+    /* 底部控制面板 */
+    #bottomHud {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      z-index: 10;
+      padding: 12px 16px 22px;
+      background: linear-gradient(to top, rgba(0,0,0,0.88) 70%, transparent);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+    }
+    .slider-row span.label { width: 68px; color: #ddd; }
+    .slider-row input[type="range"] { flex: 1; accent-color: #38bdf8; }
+    .slider-row span.val { width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
+    #zoomRow { display: none; } /* 有支援硬體變焦才顯示 */
+
+    .btn-row {
+      display: flex;
+      justify-content: space-around;
+      align-items: center;
+      margin-top: 4px;
+    }
+    button {
+      background: rgba(255,255,255,0.16);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      backdrop-filter: blur(6px);
+    }
+    button:active { transform: scale(0.95); }
+    #btnCapture {
+      background: #fff;
+      color: #000;
+      border-radius: 50%;
+      width: 58px;
+      height: 58px;
+      padding: 0;
+      font-size: 22px;
+      border: 4px solid rgba(255,255,255,0.4);
+    }
+    #btnBackCam { display: none; background: #16a34a; border: none; }
+  </style>
+</head>
+<body>
+
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <img id="uploadedImg" alt="Uploaded" />
+    <canvas id="overlay"></canvas>
+
+    <div id="topBar">
+      <div class="badge" id="statusText">載入模型中...</div>
+      <label id="uploadLabel">
+        📁 測照片
+        <input type="file" id="fileInput" accept="image/*" />
+      </label>
+    </div>
+
+    <div id="bottomHud">
+      <div class="slider-row" id="zoomRow">
+        <span class="label">鏡頭變焦</span>
+        <input type="range" id="zoomSlider" min="1" max="5" step="0.1" value="1" />
+        <span class="val" id="zoomVal">1.0x</span>
+      </div>
+
+      <div class="slider-row">
+        <span class="label">信心門檻</span>
+        <input type="range" id="confSlider" min="0.15" max="0.90" step="0.05" value="0.35" />
+        <span class="val" id="confVal">35%</span>
+      </div>
+
+      <div class="btn-row">
+        <button id="btnFlip">🔄 切鏡頭</button>
+        <button id="btnCapture" title="拍照截圖">📷</button>
+        <button id="btnPause">⏸️ 暫停</button>
+        <button id="btnBackCam">🎥 回鏡頭</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 29 個車款類別（依 Roboflow 字母排序；若辨識名稱錯位請核對 Colab 裡的 data.yaml）
+    const CLASSES = [
+      "0", "Honda_ADV-160", "Honda_ADV-350", "Honda_CB-150R", "Honda_CBR-150R",
+      "Honda_Click-125i", "Honda_Click-160", "Honda_Forza-350", "Honda_Giorno_Plus",
+      "Honda_Lead-125", "Honda_PCX-160", "Honda_Scoopy-i", "Honda_Supercub",
+      "Honda_Wave-110i", "Honda_Wave-125i", "Lambettra_X300", "Suzuki_Raider-R150",
+      "Vespa_sprint-150", "Yamaha_Aerox", "Yamaha_Exciter-155", "Yamaha_Fazzio",
+      "Yamaha_Finn", "Yamaha_Fino", "Yamaha_Grand-Filano", "Yamaha_MT-15",
+      "Yamaha_Nmax", "Yamaha_R15", "Yamaha_Xmax", "Yamaha_XSR155"
+    ];
+
+    const MODEL_PATH = "./best.onnx";
+    const INPUT_SIZE = 640;
+
+    const video = document.getElementById("video");
+    const uploadedImg = document.getElementById("uploadedImg");
+    const overlay = document.getElementById("overlay");
+    const ctx = overlay.getContext("2d");
+    const statusText = document.getElementById("statusText");
+    const confSlider = document.getElementById("confSlider");
+    const confVal = document.getElementById("confVal");
+    const zoomRow = document.getElementById("zoomRow");
+    const zoomSlider = document.getElementById("zoomSlider");
+    const zoomVal = document.getElementById("zoomVal");
+    const btnFlip = document.getElementById("btnFlip");
+    const btnPause = document.getElementById("btnPause");
+    const btnCapture = document.getElementById("btnCapture");
+    const btnBackCam = document.getElementById("btnBackCam");
+    const fileInput = document.getElementById("fileInput");
+
+    // 離屏畫布：用於縮放圖片給模型推論
+    const prepCanvas = document.createElement("canvas");
+    prepCanvas.width = INPUT_SIZE;
+    prepCanvas.height = INPUT_SIZE;
+    const prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
+
+    let session = null;
+    let currentStream = null;
+    let currentTrack = null;
+    let facingMode = "environment"; // 預設後鏡頭
+    let isPaused = false;
+    let isDetecting = false;        // 防止延遲堆積的關鍵鎖
+    let isImageMode = false;
+    let confThreshold = 0.35;
+    let lastDetections = [];
+
+    // GitHub Pages 不支援多執行緒 SharedArrayBuffer，鎖定單執行緒最穩定
+    ort.env.wasm.numThreads = 1;
+
+    // 為每個類別產生固定顏色
+    function getColor(id) {
+      const hue = (id * 137.508) % 360;
+      return `hsl(${hue}, 85%, 55%)`;
+    }
+
+    // 1. 初始化模型與相機
+    async function init() {
+      try {
+        statusText.textContent = "載入 AI 模型中（首次較久）...";
+        session = await ort.InferenceSession.create(MODEL_PATH, {
+          executionProviders: ["wasm"]
+        });
+        statusText.textContent = "模型就緒，啟動鏡頭...";
+        await startCamera();
+        requestAnimationFrame(loop);
+      } catch (err) {
+        statusText.textContent = "模型載入失敗：" + err.message;
+        console.error(err);
+      }
+    }
+
+    // 2. 啟動攝影機與硬體變焦偵測
+    async function startCamera() {
+      if (currentStream) {
+        currentStream.getTracks().forEach(t => t.stop());
+      }
+      try {
+        currentStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: facingMode,
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+        video.srcObject = currentStream;
+        await video.play();
+
+        // 偵測是否支援硬體變焦
+        currentTrack = currentStream.getVideoTracks()[0];
+        const caps = currentTrack.getCapabilities ? currentTrack.getCapabilities() : {};
+        if (caps.zoom) {
+          zoomRow.style.display = "flex";
+          zoomSlider.min = caps.zoom.min;
+          zoomSlider.max = Math.min(caps.zoom.max, 6);
+          zoomSlider.step = caps.zoom.step || 0.1;
+          zoomSlider.value = caps.zoom.min;
+          zoomVal.textContent = Number(zoomSlider.value).toFixed(1) + "x";
+        } else {
+          zoomRow.style.display = "none";
+        }
+        statusText.textContent = "即時辨識中";
+      } catch (err) {
+        statusText.textContent = "無法開啟鏡頭，請允許相機權限";
+        console.error(err);
+      }
+    }
+
+    // 3. 主迴圈（丟棄舊幀，永不延遲堆積）
+    async function loop() {
+      if (!isImageMode && !isPaused && !isDetecting && video.readyState >= 2 && session) {
+        isDetecting = true;
+        const t0 = performance.now();
+        await runInference(video, video.videoWidth, video.videoHeight);
+        const ms = Math.round(performance.now() - t0);
+        statusText.textContent = `偵測到 ${lastDetections.length} 台 | ${ms} ms`;
+        isDetecting = false;
+      }
+      requestAnimationFrame(loop);
+    }
+
+    // 4. 圖片前處理 (Letterbox 維持比例不變形) + 模型推論
+    async function runInference(sourceEl, srcW, srcH) {
+      if (!srcW || !srcH) return;
+
+      // 計算 Letterbox 縮放與黑邊
+      const scale = Math.min(INPUT_SIZE / srcW, INPUT_SIZE / srcH);
+      const newW = Math.round(srcW * scale);
+      const newH = Math.round(srcH * scale);
+      const padX = Math.floor((INPUT_SIZE - newW) / 2);
+      const padY = Math.floor((INPUT_SIZE - newH) / 2);
+
+      prepCtx.fillStyle = "#727272";
+      prepCtx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
+      prepCtx.drawImage(sourceEl, 0, 0, srcW, srcH, padX, padY, newW, newH);
+
+      const imgData = prepCtx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+      const float32Data = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
+      const area = INPUT_SIZE * INPUT_SIZE;
+
+      for (let i = 0; i < area; i++) {
+        float32Data[i] = imgData[i * 4] / 255.0;               // R
+        float32Data[i + area] = imgData[i * 4 + 1] / 255.0;    // G
+        float32Data[i + 2 * area] = imgData[i * 4 + 2] / 255.0;// B
+      }
+
+      const tensor = new ort.Tensor("float32", float32Data, [1, 3, INPUT_SIZE, INPUT_SIZE]);
+      const feeds = { [session.inputNames[0]]: tensor };
+      const results = await session.run(feeds);
+      const output = results[session.outputNames[0]];
+
+      lastDetections = parseYoloOutput(output.data, output.dims, scale, padX, padY, srcW, srcH);
+      drawOverlay(srcW, srcH, lastDetections);
+    }
+
+    // 5. 解析 YOLO11 輸出 + NMS 去除重疊框
+    function parseYoloOutput(data, dims, scale, padX, padY, srcW, srcH) {
+      const numChannels = dims[1]; // 4 + 類別數
+      const numAnchors = dims[2];  // 8400
+      const numClasses = numChannels - 4;
+      const boxes = [];
+
+      for (let i = 0; i < numAnchors; i++) {
+        let maxScore = 0;
+        let classId = -1;
+        for (let c = 0; c < numClasses; c++) {
+          const score = data[(4 + c) * numAnchors + i];
+          if (score > maxScore) {
+            maxScore = score;
+            classId = c;
+          }
+        }
+        if (maxScore < confThreshold) continue;
+        if (CLASSES[classId] === "0") continue; // 過濾資料集原本的異常類別 0
+
+        const cx = data[i];
+        const cy = data[numAnchors + i];
+        const w = data[2 * numAnchors + i];
+        const h = data[3 * numAnchors + i];
+
+        // 還原回原始影像座標
+        const x1 = Math.max(0, (cx - w / 2 - padX) / scale);
+        const y1 = Math.max(0, (cy - h / 2 - padY) / scale);
+        const x2 = Math.min(srcW, (cx + w / 2 - padX) / scale);
+        const y2 = Math.min(srcH, (cy + h / 2 - padY) / scale);
+
+        boxes.push({ x1, y1, x2, y2, score: maxScore, classId });
+      }
+
+      return nms(boxes, 0.45).slice(0, 30); // 畫面最多顯示 30 台車
+    }
+
+    function nms(boxes, iouThreshold) {
+      boxes.sort((a, b) => b.score - a.score);
+      const kept = [];
+      while (boxes.length > 0) {
+        const best = boxes.shift();
+        kept.push(best);
+        boxes = boxes.filter(b => iou(best, b) < iouThreshold);
+      }
+      return kept;
+    }
+
+    function iou(a, b) {
+      const x1 = Math.max(a.x1, b.x1);
+      const y1 = Math.max(a.y1, b.y1);
+      const x2 = Math.min(a.x2, b.x2);
+      const y2 = Math.min(a.y2, b.y2);
+      const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+      const areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
+      const areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+      return inter / (areaA + areaB - inter + 1e-6);
+    }
+
+    // 6. 繪製辨識框
+    function drawOverlay(srcW, srcH, detections) {
+      if (overlay.width !== srcW || overlay.height !== srcH) {
+        overlay.width = srcW;
+        overlay.height = srcH;
+      }
+      ctx.clearRect(0, 0, srcW, srcH);
+
+      const lineWidth = Math.max(2, Math.round(srcW / 240));
+      const fontSize = Math.max(14, Math.round(srcW / 42));
+      ctx.font = `bold ${fontSize}px sans-serif`;
+      ctx.textBaseline = "top";
+
+      for (const det of detections) {
+        const color = getColor(det.classId);
+        const label = `${CLASSES[det.classId] || det.classId} ${Math.round(det.score * 100)}%`;
+
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth;
+        ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
+
+        const textW = ctx.measureText(label).width;
+        const textH = fontSize + 6;
+        const ty = det.y1 - textH < 0 ? det.y1 : det.y1 - textH;
+
+        ctx.fillStyle = color;
+        ctx.fillRect(det.x1, ty, textW + 8, textH);
+        ctx.fillStyle = "#000";
+        ctx.fillText(label, det.x1 + 4, ty + 3);
+      }
+    }
+
+    // --- 按鈕與互動事件 ---
+    confSlider.addEventListener("input", () => {
+      confThreshold = parseFloat(confSlider.value);
+      confVal.textContent = Math.round(confThreshold * 100) + "%";
+      if (isImageMode && uploadedImg.naturalWidth) {
+        runInference(uploadedImg, uploadedImg.naturalWidth, uploadedImg.naturalHeight);
+      }
+    });
+
+    zoomSlider.addEventListener("input", async () => {
+      const z = parseFloat(zoomSlider.value);
+      zoomVal.textContent = z.toFixed(1) + "x";
+      if (currentTrack) {
+        try {
+          await currentTrack.applyConstraints({ advanced: [{ zoom: z }] });
+        } catch (e) { console.warn("變焦失敗", e); }
+      }
+    });
+
+    btnFlip.addEventListener("click", () => {
+      facingMode = facingMode === "environment" ? "user" : "environment";
+      startCamera();
+    });
+
+    btnPause.addEventListener("click", () => {
+      isPaused = !isPaused;
+      if (isPaused) {
+        video.pause();
+        btnPause.textContent = "▶️ 繼續";
+      } else {
+        video.play();
+        btnPause.textContent = "⏸️ 暫停";
+      }
+    });
+
+    // 拍照截圖（合併影像與辨識框）
+    btnCapture.addEventListener("click", () => {
+      const srcEl = isImageMode ? uploadedImg : video;
+      const w = isImageMode ? uploadedImg.naturalWidth : video.videoWidth;
+      const h = isImageMode ? uploadedImg.naturalHeight : video.videoHeight;
+      if (!w || !h) return;
+
+      const snap = document.createElement("canvas");
+      snap.width = w;
+      snap.height = h;
+      const sctx = snap.getContext("2d");
+      sctx.drawImage(srcEl, 0, 0, w, h);
+      sctx.drawImage(overlay, 0, 0, w, h);
+
+      const link = document.createElement("a");
+      link.download = `moto_${Date.now()}.jpg`;
+      link.href = snap.toDataURL("image/jpeg", 0.92);
+      link.click();
+    });
+
+    // 上傳照片測試
+    fileInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      isImageMode = true;
+      video.style.display = "none";
+      uploadedImg.style.display = "block";
+      btnFlip.style.display = "none";
+      btnPause.style.display = "none";
+      btnBackCam.style.display = "inline-block";
+
+      uploadedImg.onload = async () => {
+        statusText.textContent = "辨識照片中...";
+        await runInference(uploadedImg, uploadedImg.naturalWidth, uploadedImg.naturalHeight);
+        statusText.textContent = `照片偵測到 ${lastDetections.length} 台`;
+      };
+      uploadedImg.src = URL.createObjectURL(file);
+    });
+
+    // 從照片模式切回即時鏡頭
+    btnBackCam.addEventListener("click", () => {
+      isImageMode = false;
+      uploadedImg.style.display = "none";
+      video.style.display = "block";
+      btnFlip.style.display = "inline-block";
+      btnPause.style.display = "inline-block";
+      btnBackCam.style.display = "none";
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      fileInput.value = "";
+    });
+
+    init();
+  </script>
+</body>
+</html>
